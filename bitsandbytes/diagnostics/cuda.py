@@ -137,7 +137,7 @@ def _print_cuda_diagnostics(cuda_specs: CUDASpecs) -> None:
 
 
 def _print_hip_diagnostics(cuda_specs: CUDASpecs) -> None:
-    print(f"PyTorch settings found: HIP_VERSION={cuda_specs.cuda_version_string}")
+    print(f"PyTorch settings found: ROCM_VERSION={cuda_specs.cuda_version_string}")
 
     rocm_override = os.environ.get("BNB_ROCM_VERSION")
     if rocm_override:
@@ -149,24 +149,17 @@ def _print_hip_diagnostics(cuda_specs: CUDASpecs) -> None:
             f"""
             No compatible ROCm library found (tried: {binary_path.name}). You may need to compile from source:
             https://huggingface.co/docs/bitsandbytes/main/en/installation#rocm-compile
-            Use BNB_ROCM_VERSION to force a specific HIP-version suffix if needed.
+            Use BNB_ROCM_VERSION to force a specific version if needed.
             """,
         )
 
-    rocm_version = getattr(torch.version, "rocm", None)
-    if rocm_version is not None:
-        try:
-            rocm_major, rocm_minor = map(int, rocm_version.split(".")[:2])
-        except (ValueError, IndexError):
-            pass
-        else:
-            if (rocm_major, rocm_minor) < (6, 4):
-                print_dedented(
-                    """
-                    WARNING: ROCm 6.4 or newer is required when compiling bitsandbytes from source.
-                    Current prebuilt Linux binaries begin at ROCm 6.4.4.
-                    """,
-                )
+    hip_major, hip_minor = cuda_specs.cuda_version_tuple
+    if (hip_major, hip_minor) < (6, 1):
+        print_dedented(
+            """
+            WARNING: bitsandbytes is fully supported only from ROCm 6.1.
+            """,
+        )
 
 
 def print_diagnostics(cuda_specs: CUDASpecs) -> None:

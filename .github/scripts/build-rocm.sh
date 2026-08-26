@@ -1,24 +1,26 @@
 #!/bin/bash
 set -xeuo pipefail
 
-if [[ "${RUNNER_OS:-}" != "Linux" && "${RUNNER_OS:-}" != "Windows" ]]; then
-    echo "Invalid RUNNER_OS '${RUNNER_OS:-}'; expected Linux or Windows." >&2
-    exit 1
-fi
-
-if [[ ! "${ROCM_VERSION:-}" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?$ ]]; then
-    echo "Invalid ROCM_VERSION '${ROCM_VERSION:-}'; expected a dotted ROCm release such as 7.14." >&2
-    exit 1
-fi
-
-rocm_version_major="$((10#${BASH_REMATCH[1]}))"
-rocm_version_minor="$((10#${BASH_REMATCH[2]}))"
+: "${RUNNER_OS:?RUNNER_OS must be set (Linux/Windows)}"
+: "${ROCM_VERSION:?ROCM_VERSION must be set}"
 
 rocm_version_at_least() {
-    local required_major required_minor
-    IFS=. read -r required_major required_minor <<< "$1"
-    ((rocm_version_major > required_major ||
-        (rocm_version_major == required_major && rocm_version_minor >= required_minor)))
+    local required_version="$1"
+    local current_major current_minor required_major required_minor
+
+    IFS=. read -r current_major current_minor _ <<< "${ROCM_VERSION}"
+    IFS=. read -r required_major required_minor _ <<< "${required_version}"
+
+    if ((current_major > required_major)); then
+        return 0
+    fi
+    if ((current_major < required_major)); then
+        return 1
+    fi
+    if ((current_minor >= required_minor)); then
+        return 0
+    fi
+    return 1
 }
 
 bnb_rocm_arch="gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1103"
@@ -92,17 +94,4 @@ fi
 
 output_dir="output/${RUNNER_OS}/X64"
 mkdir -p "${output_dir}"
-libraries=()
-shopt -s nullglob
-for extension in so dylib dll; do
-    for library in bitsandbytes/libbitsandbytes_rocm*."${extension}"; do
-        libraries+=("${library}")
-    done
-done
-shopt -u nullglob
-
-if [ "${#libraries[@]}" -eq 0 ]; then
-    echo "No ROCm-backend library was built (expected bitsandbytes/libbitsandbytes_rocm*.{so,dylib,dll})." >&2
-    exit 1
-fi
-cp "${libraries[@]}" "${output_dir}/"
+(shopt -s nullglob && cp bitsandbytes/*.{so,dylib,dll} "${output_dir}")

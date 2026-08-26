@@ -25,89 +25,58 @@ def get_cuda_bnb_library_path(cuda_specs: CUDASpecs) -> Path:
 
     When no override is set, selects from packaged libraries using the following priority:
     1. Exact version match.
-    2. Highest packaged version <= runtime version, same major (e.g. runtime 12.9, packaged 12.8).
-    3. Lowest packaged version > runtime version, same major (e.g. runtime 12.0, packaged 12.1).
-    4. For the ROCm backend only, repeat the same older-first selection across HIP major versions.
-    ROCm-backend selection uses the version tuple reported by ``torch.version.hip``; it does
-    not infer a ROCm release from ``torch.version.rocm``. CUDA does not fall back across major
-    versions. A warning is logged when falling back.
-    Overrides select the requested filename directly. The returned path is not guaranteed
-    to exist when no packaged libraries are found or an override names an absent version.
+    2. Highest packaged version <= runtime version, same major (e.g. runtime 12.9, ship 12.8).
+    3. Lowest packaged version > runtime version, same major (e.g. runtime 12.0, ship 12.1).
+    No cross-major fallback: if no same-major library exists, returns the exact non-existent
+    path so the caller raises a clear "not found" error.
+    A warning is logged when falling back. Override env vars bypass selection entirely
+    and load the named version with no fallback. The returned path is not guaranteed to
+    exist when no packaged libs are found, or when an override names an absent version.
     """
     is_hip = bool(torch.version.hip)
     prefix = "rocm" if is_hip else "cuda"
     override_var = "BNB_ROCM_VERSION" if is_hip else "BNB_CUDA_VERSION"
-    other_override_var = "BNB_CUDA_VERSION" if is_hip else "BNB_ROCM_VERSION"
-
-    if os.environ.get(other_override_var):
-        logger.warning(
-            "%s is ignored because PyTorch is using %s; use %s instead.",
-            other_override_var,
-            "ROCm" if is_hip else "CUDA",
-            override_var,
-        )
 
     override_value = os.environ.get(override_var)
 
     if override_value is not None:
-        try:
-            override_version = _parse_version_override(override_value, is_hip)
-        except ValueError as error:
-            example = "7.14 or 714" if is_hip else "12.8 or 128"
-            raise RuntimeError(
-                f"{override_var}={override_value!r}: expected a dotted version or shortcode ({example})."
-            ) from error
-
-        version_tag = _format_native_version_tag(override_version)
-        library_name = f"libbitsandbytes_{prefix}{version_tag}{DYNAMIC_LIBRARY_SUFFIX}"
-        override_path = PACKAGE_DIR / library_name
+        if not override_value.isdigit():
+            raise RuntimeError(f"{override_var}={override_value!r}: value must be digits only (e.g. '124' for 12.4).")
+        library_name = f"libbitsandbytes_{prefix}{override_value}{DYNAMIC_LIBRARY_SUFFIX}"
         logger.warning(
-            f"WARNING: {override_var}={override_value} environment variable detected; "
-            f"loading {override_path.name}.\n"
+            f"WARNING: {override_var}={override_value} environment variable detected; loading {library_name}.\n"
             f"This overrides automatic {'ROCm' if is_hip else 'CUDA'} version selection.\n"
             f"If this was unintended clear the variable and retry: unset {override_var}\n",
         )
-        return override_path
+        return PACKAGE_DIR / library_name
 
     available = _find_cuda_libs(prefix, is_hip)
     runtime_version = cuda_specs.cuda_version_tuple
-    runtime_tag = _format_native_version_tag(runtime_version)
 
     if not available:
-        return PACKAGE_DIR / f"libbitsandbytes_{prefix}{runtime_tag}{DYNAMIC_LIBRARY_SUFFIX}"
+        return PACKAGE_DIR / f"libbitsandbytes_{prefix}{cuda_specs.cuda_version_string}{DYNAMIC_LIBRARY_SUFFIX}"
 
     if runtime_version in available:
         return available[runtime_version]
 
-    missing_path = PACKAGE_DIR / f"libbitsandbytes_{prefix}{runtime_tag}{DYNAMIC_LIBRARY_SUFFIX}"
-    same_major = [version for version in available if version[0] == runtime_version[0]]
-    cross_major = False
-    lower = [version for version in same_major if version < runtime_version]
+    lower = [v for v in available if v[0] == runtime_version[0] and v < runtime_version]
     if lower:
         selected = max(lower)
-    elif same_major:
-        selected = min(same_major)
-    elif is_hip:
-        lower = [version for version in available if version < runtime_version]
-        selected = max(lower) if lower else min(available)
-        cross_major = True
     else:
-        return missing_path
+        higher_same = [v for v in available if v[0] == runtime_version[0] and v > runtime_version]
+        if higher_same:
+            selected = min(higher_same)
+        else:
+            # No same-major library available. Return the non-existent exact path so
+            # get_native_library() raises a clear "not found" error.
+            return PACKAGE_DIR / f"libbitsandbytes_{prefix}{cuda_specs.cuda_version_string}{DYNAMIC_LIBRARY_SUFFIX}"
 
-    if cross_major:
-        logger.warning(
-            f"No prebuilt ROCm-backend binary for HIP {runtime_version[0]}.{runtime_version[1]}, loading "
-            f"HIP {selected[0]}.{selected[1]} across major versions. This binary may be incompatible "
-            "or may not contain code for your GPU architecture. "
-            f"Set {override_var} to override or compile from source."
-        )
-    else:
-        logger.warning(
-            f"No prebuilt binary for {'ROCm-backend HIP' if is_hip else 'CUDA'} "
-            f"{runtime_version[0]}.{runtime_version[1]}, loading "
-            f"{'HIP' if is_hip else 'CUDA'} {selected[0]}.{selected[1]} instead. "
-            f"Set {override_var} to override."
-        )
+    logger.warning(
+        f"No prebuilt binary for {'ROCm' if is_hip else 'CUDA'} "
+        f"{runtime_version[0]}.{runtime_version[1]}, loading "
+        f"{'ROCm' if is_hip else 'CUDA'} {selected[0]}.{selected[1]} instead. "
+        f"Set {override_var} to override."
+    )
     return available[selected]
 
 
@@ -155,47 +124,26 @@ class XpuBNBNativeLibrary(BNBNativeLibrary):
             lib.cget_managed_ptr.restype = ct.c_void_p
 
 
-def _format_native_version_tag(version: tuple[int, int]) -> str:
-    major, minor = version
-    return f"{major}{minor}"
-
-
-def _split_cuda_version(version_tag: str, is_hip: bool) -> tuple[int, int]:
-    """Split a CUDA/ROCm library filename tag into (major, minor).
+def _split_cuda_version(compact: str, is_hip: bool) -> tuple[int, int]:
+    """Split a compact CUDA/ROCm version string from a library filename into (major, minor).
 
     CUDA: major is always 2 digits (11, 12, 13...), e.g. '118' -> (11, 8), '132' -> (13, 2).
-    ROCm: supported majors 6-9 use one digit, e.g. '72' -> (7, 2)
-    and '713' -> (7, 13). Tags starting with 1-5 reserve two major digits.
+    ROCm: major is always 1 digit for now (6, 7...), e.g. '72' -> (7, 2), '713' -> (7, 13).
+    Note: revisit if ROCm major reaches 10.
     """
     if is_hip:
-        if len(version_tag) >= 3 and version_tag[0] in "12345":
-            return int(version_tag[:2]), int(version_tag[2:])
-        return int(version_tag[:1]), int(version_tag[1:])
-    return int(version_tag[:2]), int(version_tag[2:])
-
-
-def _parse_version_override(value: str, is_hip: bool) -> tuple[int, int]:
-    dotted = re.fullmatch(r"(\d+)\.(\d+)(?:\.\d+(?:[A-Za-z0-9+_.-]*)?)?", value)
-    if dotted:
-        return int(dotted.group(1)), int(dotted.group(2))
-    if value.isdigit():
-        return _split_cuda_version(value, is_hip)
-    raise ValueError(f"Invalid version override: {value}")
+        return int(compact[:1]), int(compact[1:])
+    return int(compact[:2]), int(compact[2:])
 
 
 def _find_cuda_libs(prefix: str, is_hip: bool) -> dict[tuple[int, int], Path]:
     """Return a {(major, minor): Path} mapping for all packaged CUDA/ROCm library files."""
     result = {}
     for lib in PACKAGE_DIR.glob(f"libbitsandbytes_{prefix}*{DYNAMIC_LIBRARY_SUFFIX}"):
-        match = re.fullmatch(
-            rf"libbitsandbytes_{re.escape(prefix)}(\d+){re.escape(DYNAMIC_LIBRARY_SUFFIX)}",
-            lib.name,
-        )
+        match = re.search(rf"{prefix}(\d+)", lib.name)
         if match:
             try:
-                version_tag = match.group(1)
-                version = _split_cuda_version(version_tag, is_hip)
-                result[version] = lib
+                result[_split_cuda_version(match.group(1), is_hip)] = lib
             except (ValueError, IndexError):
                 continue
     return result
@@ -205,11 +153,11 @@ def get_available_cuda_binary_versions() -> list[str]:
     """Get formatted CUDA/ROCm versions from existing library files."""
     is_hip = bool(torch.version.hip)
     prefix = "rocm" if is_hip else "cuda"
-    return [f"{major}.{minor}" for major, minor in sorted(_find_cuda_libs(prefix, is_hip))]
+    return sorted(f"{major}.{minor}" for major, minor in _find_cuda_libs(prefix, is_hip))
 
 
 def parse_cuda_version(version_str: str) -> str:
-    """Convert a compact version tag (e.g. '118', '714') to a dotted version."""
+    """Convert a raw version code string (e.g. '118', '713') to a dotted version (e.g. '11.8', '7.13')."""
     if version_str.isdigit():
         is_hip = bool(torch.version.hip)
         try:
@@ -327,7 +275,7 @@ class ErrorHandlerMockBNBNativeLibrary(BNBNativeLibrary):
                 "You have two options:\n"
                 "1. COMPILE FROM SOURCE as mentioned here:\n"
                 "   https://huggingface.co/docs/bitsandbytes/main/en/installation?backend=AMD+ROCm#amd-gpu\n"
-                "2. Use BNB_ROCM_VERSION to select a DIFFERENT HIP-version suffix for the ROCm-backend binary, matching the version the library was built with.\n\n"
+                "2. Use BNB_ROCM_VERSION to specify a DIFFERENT ROCm version from the detected one, matching the version the library was built with.\n\n"
             )
         )
 
